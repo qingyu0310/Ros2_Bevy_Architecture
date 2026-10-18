@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ros2_layer</name>
+  <version>0.1.0</version>
+  <description>ROS2 节点：图像适配与视觉流水线，节点类以头文件形式提供</description>
+  <maintainer email="qingyu0310@users.noreply.github.com">qingyu</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>rm_interfaces</depend>
+  <depend>opencv2</depend>
+  <depend>framework</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

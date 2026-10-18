@@ -1,0 +1,98 @@
+# 视觉节点参数。project 的 vision 入口从 share/project/params/vision.yaml 加载。
+# 参数文件按节点名分段，节点名由入口的 Node 构造决定（这里是 /vision）。
+/vision:
+  ros__parameters:
+    # ---- 话题 ----
+    image_topic: "/vision/image"
+    camera_info_topic: "/vision/camera_info"
+    output_image_topic: "/vision/debug_image"
+
+    # ---- 检测（0526 TensorRT） ----
+    # engine 必须本机生成，路径要能直接打开
+    engine_path: "/home/qingyudd01/projects/vscode/opencv/build/0526.engine"
+    cuda_device: 0
+
+    # 后处理门限，与旧工程 trd_vision.yaml 一致
+    score_threshold: 0.7
+    confidence_threshold: 0.8
+    nms_threshold: 0.3
+
+    # ---- 自瞄 ----
+    # 是否把云台指令发出去；接仿真时打开，只调算法时关掉
+    aim_enabled: true
+    # 指令话题；仿真的 Daedalus 订阅这个
+    aim_topic: "/rm_gimbal/cmd"
+    # 解算后的 yaw/pitch 要转到的坐标系；仿真没有 odom 以外的世界系，用 map
+    aim_frame: "map"
+    # TF 话题：相机位姿从 map → camera_optical_frame 这条变换取，按图像时间戳插值
+    tf_topic: "/tf"
+    # 图像所在的坐标系；与 aim_frame 一起选出要缓存的那条 TF
+    camera_frame: "camera_optical_frame"
+    # 图像时间戳晚于最后一条姿态样本时，最多用最后一条顶替多久，单位 s。调大：更少跳帧，但姿态更旧
+    pose_hold_s: 0.03
+    # 敌方颜色：red / blue。只有这个颜色的装甲板会进跟踪器；己方同号车不会被误跟
+    enemy_color: "blue"
+    # 目标偏离光轴小于它才给 fire_advice，单位度；调大：更容易开火
+    aim_fire_angle_deg: 1.5
+    # 超过这个距离不给 fire_advice，单位 m
+    aim_distance_max_m: 8.0
+    # 标定用：形如 "30,80" 时忽略解算、恒发这组绝对角（yaw,pitch）；留空正常自瞄
+    aim_fixed_yaw_pitch: ""
+
+    # ---- 跟踪 ----
+    # 整车面数；四面车为 4
+    armor_num: 4
+
+    # 车体旋转半径初值，单位 m；单板帧固定使用
+    radius_init_m: 0.2
+
+    # 四点观测噪声基准，单位 pixel。调大：更不信观测，平滑但迟钝；调小：跟得紧但抖
+    point_sigma_px: 8.0
+
+    # 板法向角的先验标准差，单位 rad。调大：更信 PnP 解出的法向；调小：法向更稳但迟钝
+    angle_prior_rad: 0.15
+
+    # 车心加速度方差。调大：机动跟得上但静止时抖；调小：静止稳但滞后
+    accel_variance: 10.0
+
+    # 角加速度方差。调大：换面跟得快但转速估计抖；调小：转速平滑但突变滞后
+    angular_accel_variance: 100.0
+
+    # 半径/半径差/高度差的过程噪声。单板帧不估计形状，只有同帧匹配到两个面才生效
+    shape_variance: 0.1
+
+    # 从 detecting 升到 tracking 需要的连续确认帧数。调大：更不容易跟错，但起跟更慢
+    min_detect_count: 5
+
+    # tracking 丢帧后最多容忍多少帧再回 lost。调大：短暂遮挡后能接上；调小：更快放弃
+    max_temp_lost_count: 25
+
+    # 面关联：预测中心与检测中心的像素距离上限。调大：更容易匹配
+    center_gate_px: 100.0
+
+    # 面关联：四角平均像素误差上限
+    corner_gate_px: 140.0
+
+    # 面关联：四条边方向角差之和上限，单位 rad
+    angle_gate_rad: 0.8
+
+    # 面关联：预测与实际周长的相对差上限
+    perimeter_ratio_gate: 0.6
+
+    # NIS 失败率上限，超过就判丢。调大：更容忍模型误差；调小：异常帧更快丢目标
+    nis_failure_ratio: 0.8
+
+    # 瞄准面打分：score = w_center·中心距离² + w_cost·代价² + w_angle·夹角²，取最小的一对
+    # 中心距离权重。调大：更偏向画面中心的板
+    aim_weight_center: 1.0
+
+    # 关联代价权重。调大：更偏向与预测更贴合的板
+    aim_weight_cost: 1.0
+
+    # 视线夹角权重。调大：更偏向正对相机的板
+    aim_weight_angle: 1.0
+
+    # ---- 可视化 ----
+    # 是否开 OpenCV 窗口。无桌面或远程调试时关掉，改用 rqt_image_view 看 /vision/debug_image
+    show_window: true
+    window_name: "Vision"

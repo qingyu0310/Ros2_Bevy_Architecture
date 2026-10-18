@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>framework</name>
+  <version>0.1.0</version>
+  <description>视觉算法与设备模块：检测、位姿、跟踪、标定、滤波，不依赖线程与 ROS</description>
+  <maintainer email="qingyu0310@users.noreply.github.com">qingyu</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>eigen</depend>
+  <depend>opencv2</depend>
+  <!-- CUDA / TensorRT 不是 ROS 包，不走依赖声明；由 CMakeLists 里 find_package 直接找 -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

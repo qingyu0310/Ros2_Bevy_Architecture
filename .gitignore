@@ -1,0 +1,17 @@
+# colcon 产物
+build/
+install/
+log/
+
+# 参考工程与旧代码，不入库
+temp/
+
+# 仿真构建产物与本地缓存
+third_party/bevy_robomaster_simulator-master/target/
+third_party/bevy_robomaster_simulator-master/rm_interfaces/build/
+third_party/bevy_robomaster_simulator-master/rm_interfaces/install/
+**/*.o
+**/*.a
+**/*.so
+**/*.engine
+**/__pycache__/

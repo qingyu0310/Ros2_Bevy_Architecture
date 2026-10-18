@@ -1,0 +1,13 @@
+# 相机适配参数。project 的 camera 入口从 share/project/params/camera.yaml 加载。
+# 参数文件按节点名分段，节点名由入口的 Node 构造决定（这里是 /camera）。
+/camera:
+  ros__parameters:
+    # 输入图像话题。仿真是 /image_raw（rgb8），实机将来也发这里（bgr8），节点按 encoding 分支
+    input_topic: "/image_raw"
+
+    # 转发给视觉链的 BGR 图像。固定 bgr8，算法层只认 BGR
+    output_topic: "/vision/image"
+
+    # 内参话题：原样转发到输出话题，视觉节点只从这里取内参
+    camera_info_topic: "/camera_info"
+    camera_info_output_topic: "/vision/camera_info"
