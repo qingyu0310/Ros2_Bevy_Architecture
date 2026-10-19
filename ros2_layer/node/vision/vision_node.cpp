@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 
 #include <opencv2/highgui.hpp>
@@ -29,6 +31,16 @@ VisionNode::VisionNode(const rclcpp::NodeOptions& options) : rclcpp::Node("visio
     detector_ = std::make_unique<algorithm::vision::ArmorDetector>(detector_config_);
     tracker_  = std::make_unique<algorithm::vision::Tracker>(tracker_config_);
     window_start_ = now();
+
+    if (params_.drop_dump_limit > 0)
+    {
+        std::error_code error;
+        std::filesystem::create_directories(params_.drop_dump_dir, error);
+        if (error)
+        {
+            RCLCPP_WARN(get_logger(), "漏检帧目录建不出来：%s（%s），本次不落盘", params_.drop_dump_dir.c_str(), error.message().c_str());
+        }
+    }
 
     // 自瞄发指令前要把瞄准点从相机系换到 map 系，这里仍用 tf2 的 buffer
     tf_buffer_     = std::make_unique<tf2_ros::Buffer>(get_clock());
@@ -47,6 +59,10 @@ VisionNode::VisionNode(const rclcpp::NodeOptions& options) : rclcpp::Node("visio
     info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
         params_.info_topic, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) { on_camera_info(*msg); });
+
+    auto_aim_sub_ = create_subscription<std_msgs::msg::Bool>(
+        params_.auto_aim_topic, rclcpp::QoS(10),
+        [this](std_msgs::msg::Bool::ConstSharedPtr msg) { on_auto_aim(*msg); });
 
     image_pub_ = create_publisher<sensor_msgs::msg::Image>(params_.output_image_topic, rclcpp::SensorDataQoS());
 
@@ -88,6 +104,9 @@ void VisionNode::read_parameters()
     params_.aim_fire_angle_deg = declare_parameter("aim_fire_angle_deg", params_.aim_fire_angle_deg);
     params_.aim_distance_max_m = declare_parameter("aim_distance_max_m", params_.aim_distance_max_m);
     params_.aim_fixed_yaw_pitch = declare_parameter("aim_fixed_yaw_pitch", params_.aim_fixed_yaw_pitch);
+    params_.auto_aim_topic     = declare_parameter("auto_aim_topic", params_.auto_aim_topic);
+    params_.drop_dump_dir      = declare_parameter("drop_dump_dir", params_.drop_dump_dir);
+    params_.drop_dump_limit    = declare_parameter("drop_dump_limit", params_.drop_dump_limit);
     if (!params_.aim_fixed_yaw_pitch.empty())
     {
         double fixed_yaw = 0.0;
@@ -133,6 +152,7 @@ void VisionNode::read_parameters()
     tracker_config_.aim_weight_center                = declare_parameter("aim_weight_center",      tracker_config_.aim_weight_center);
     tracker_config_.aim_weight_cost                  = declare_parameter("aim_weight_cost",        tracker_config_.aim_weight_cost);
     tracker_config_.aim_weight_angle                 = declare_parameter("aim_weight_angle",       tracker_config_.aim_weight_angle);
+    tracker_config_.aim_switch_cost                  = declare_parameter("aim_switch_cost",        tracker_config_.aim_switch_cost);
 }
 
 /**
@@ -179,18 +199,7 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
     const auto begin = std::chrono::steady_clock::now();
     algorithm::vision::ArmorDetectionResult result = detector_->Detect(image);
 
-    // dt 用 ROS 时间算：仿真下 ROS 时钟与墙钟不同源，混用会让角速度估计全错
     const rclcpp::Time stamp(msg.header.stamp);
-    double dt_s = 1.0 / 30.0;
-    if (last_stamp_)
-    {
-        const double measured = (stamp - *last_stamp_).seconds();
-        if (measured > 0.0 && measured < 1.0)
-        {
-            dt_s = measured;
-        }
-    }
-    last_stamp_ = stamp;
 
     // 只把敌方颜色的装甲板送进跟踪器：同一编号的红蓝两辆车否则会抢同一个槽，
     // 面序匹配挑错对象后状态被拽飞、门全拒，跟踪再也拉不回来
@@ -204,6 +213,31 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
             enemy_armors.push_back(armor);
         }
     }
+
+    // 目标两块掉成一块时留下现场：整帧分数一起掉说明是图像本身坏了，不是某个目标卡门限
+    if (last_enemy_count_ >= 2 && enemy_armors.size() < last_enemy_count_)
+    {
+        detect_drops_++;
+        if (detect_drops_ <= params_.drop_dump_limit)
+        {
+            cv::Mat gray;
+            cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+            cv::Scalar mean;
+            cv::Scalar deviation;
+            cv::meanStdDev(gray, mean, deviation);
+
+            cv::imwrite(params_.drop_dump_dir + "/drop_" + std::to_string(detect_drops_) + ".png", image);
+            RCLCPP_INFO(get_logger(), "det drop #%d kept=%zu -> %zu max_obj=%.2f score_pass=%zu nms=%zu rej_conf=%zu | gray mean=%.1f std=%.1f | %s/drop_%d.png",
+                        detect_drops_, last_enemy_count_, enemy_armors.size(), result.stats.max_objectness,
+                        result.stats.score_passed, result.stats.nms_kept, result.stats.rejected_confidence,
+                        mean[0], deviation[0], params_.drop_dump_dir.c_str(), detect_drops_);
+        }
+        else if (detect_drops_ == params_.drop_dump_limit + 1)
+        {
+            RCLCPP_INFO(get_logger(), "det drop: 已抓够 %d 张，后续只计数不落盘", params_.drop_dump_limit);
+        }
+    }
+    last_enemy_count_ = enemy_armors.size();
 
     // 每帧取一次相机到 map 的位姿，跟踪器据此工作在稳定的世界系
     const double image_stamp = stamp.seconds();
@@ -220,7 +254,61 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
     window_pose_offset_max_ = std::max(window_pose_offset_max_, image_stamp - pose_latest);
     if (frame_)
     {
-        tracker_->ProcessFrame(enemy_armors, algorithm::vision::ArmorDimensions {}, *camera_, *frame_, dt_s);
+        // 松开自瞄键时不跑跟踪：不选板、不锁车、不推进 EKF。否则松开期间会一直锁着
+        // 第一次按下的那辆车，下次按下还是它
+        if (auto_aim_pressed_)
+        {
+            // dt 用距上一次真正推进跟踪器的时间：姿态缺失的帧整帧跳过，不推进也不记时间戳。
+            // 用"距上一张图像"的话，丢一帧后下一帧只补一个图像间隔，实际过了两帧，
+            // 小陀螺下就是几度的转角预测误差，直接掉出关联门
+            double dt_s = 1.0 / 30.0;
+            if (last_stamp_)
+            {
+                const double measured = (stamp - *last_stamp_).seconds();
+                if (measured > 0.0 && measured < 1.0)
+                {
+                    dt_s = measured;
+                }
+            }
+            last_stamp_ = stamp;
+            tracker_->ProcessFrame(enemy_armors, algorithm::vision::ArmorDimensions {}, *camera_, *frame_, dt_s);
+
+            // 换面现场：记下这一帧候选/匹配数与各次配对的门限分项，判断是关联只剩一条
+            // 还是双板帧里打分换了面
+            const std::int32_t face = tracker_->Report().last_face;
+            if (last_face_seen_ >= 0 && face != last_face_seen_)
+            {
+                const algorithm::vision::TrackerReport& report = tracker_->Report();
+                RCLCPP_INFO(get_logger(), "face switch %d -> %d kept=%zu candidates=%zu matches=%zu locked label=%d size=%d",
+                            last_face_seen_, face, enemy_armors.size(), report.candidate_count, report.match_count,
+                            static_cast<std::int32_t>(tracker_->Label()), static_cast<std::int32_t>(tracker_->Size()));
+                // 每块检测的身份：候选数比检测数少时，就是编号或尺寸对不上被筛掉了
+                for (const algorithm::vision::DetectedArmor& armor : enemy_armors)
+                {
+                    RCLCPP_INFO(get_logger(), "  kept label=%d raw_label=%d size=%d center=(%.0f, %.0f) conf=%.2f",
+                                static_cast<std::int32_t>(armor.GetLabel()), armor.GetRawLabelId(),
+                                static_cast<std::int32_t>(armor.GetSize()),
+                                armor.GetCenter().x, armor.GetCenter().y,
+                                static_cast<double>(armor.GetConfidence()));
+                }
+                const std::size_t count = std::min<std::size_t>(report.diagnostics.size(), 4);
+                for (std::size_t index = 0; index < count; ++index)
+                {
+                    const algorithm::vision::AssociationDiagnostic& diag = report.diagnostics[index];
+                    RCLCPP_INFO(get_logger(), "  cand=%zu face=%d norm=%.2f center=%.1f/%d corner=%.1f/%d angle=%.2f/%d perimeter=%.2f/%d",
+                                diag.candidate, diag.face, diag.normalized_cost,
+                                diag.center_error_px, diag.center_ok ? 1 : 0,
+                                diag.corner_error_px, diag.corner_ok ? 1 : 0,
+                                diag.angle_error_rad, diag.angle_ok ? 1 : 0,
+                                diag.perimeter_ratio, diag.perimeter_ok ? 1 : 0);
+                }
+            }
+            last_face_seen_ = face;
+        }
+        else
+        {
+            tracker_->Reset(algorithm::vision::ResetReason::Manual);
+        }
     }
     else
     {
@@ -249,11 +337,22 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
     }
 
     publish_image(drawn, msg.header);
-    if (aim_publisher_)
+    // 只按自瞄键时发指令；松开后仿真端已经不再订阅云台，视觉这侧也不该继续发目标
+    if (aim_publisher_ && auto_aim_pressed_)
     {
         aim_publisher_->Publish(msg.header, *tracker_, frame_, gimbal_world_);
     }
     log_window(result, processing_ms, age_ms);
+}
+
+/**
+ * @brief 记录自瞄键状态
+ *
+ * 只有按住期间才跑跟踪和发指令；松开期间每帧都把车型重置，所以下次按下会重新选板。
+ */
+void VisionNode::on_auto_aim(const std_msgs::msg::Bool& msg)
+{
+    auto_aim_pressed_ = msg.data;
 }
 
 /**
@@ -476,6 +575,7 @@ const char* VisionNode::ResetReasonName(algorithm::vision::ResetReason reason)
         case algorithm::vision::ResetReason::Nis:        return "nis";
         case algorithm::vision::ResetReason::Diverged:   return "diverged";
         case algorithm::vision::ResetReason::InitFailed: return "init_failed";
+        case algorithm::vision::ResetReason::Manual:     return "manual";
     }
     return "?";
 }
@@ -489,6 +589,15 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
     window_processing_ms_ += processing_ms;
     window_age_ms_ += age_ms;
     window_accepted_ += result.stats.accepted;
+    window_stats_.score_passed        += result.stats.score_passed;
+    window_stats_.nms_kept            += result.stats.nms_kept;
+    window_stats_.rejected_confidence += result.stats.rejected_confidence;
+    window_stats_.rejected_color      += result.stats.rejected_color;
+    window_stats_.rejected_label_type += result.stats.rejected_label_type;
+    window_stats_.rejected_geometry   += result.stats.rejected_geometry;
+    window_stats_.max_objectness       = std::max(window_stats_.max_objectness, result.stats.max_objectness);
+    const std::size_t enemy_count = last_armors_.size();
+    window_enemy_min_ = window_enemy_min_ == 0 ? enemy_count : std::min(window_enemy_min_, enemy_count);
 
     const double elapsed = (now() - window_start_).seconds();
     if (elapsed < 1.0)
@@ -503,7 +612,17 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
                 window_processing_ms_ / denominator,
                 window_age_ms_ / denominator);
 
-    RCLCPP_INFO(get_logger(), "  detections=%zu（敌方颜色检测）", last_armors_.size());
+    // 逐级计数：远处目标若漏检，先看它掉在哪一级（初筛 / NMS / 终选 / 颜色 / 标签 / 几何）
+    RCLCPP_INFO(get_logger(), "  det stats score_pass=%llu nms=%llu acc=%llu | rej conf=%llu color=%llu label=%llu geom=%llu | max_obj=%.2f min_enemy=%zu",
+                static_cast<unsigned long long>(window_stats_.score_passed),
+                static_cast<unsigned long long>(window_stats_.nms_kept),
+                static_cast<unsigned long long>(window_accepted_),
+                static_cast<unsigned long long>(window_stats_.rejected_confidence),
+                static_cast<unsigned long long>(window_stats_.rejected_color),
+                static_cast<unsigned long long>(window_stats_.rejected_label_type),
+                static_cast<unsigned long long>(window_stats_.rejected_geometry),
+                static_cast<double>(window_stats_.max_objectness), window_enemy_min_);
+
     for (const algorithm::vision::DetectedArmor& armor : last_armors_)
     {
         RCLCPP_INFO(get_logger(), "  det color=%s label=%d size=%d center=(%.0f, %.0f) conf=%.2f",
@@ -560,26 +679,6 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
                     snapshot.shape_jacobian_norm_r, snapshot.shape_jacobian_norm_l, snapshot.shape_jacobian_norm_h,
                     snapshot.shape_radius_step, snapshot.shape_radius_gap_step, snapshot.shape_height_gap_step,
                     report.match_count >= 2 ? 1 : 0, report.match_count);
-
-        // 四个面在跟踪系（世界系）的中心；与当帧检测的板心对照，能区分"状态偏了"和"投影错了"
-        const std::vector<algorithm::vision::FaceState> faces = tracker_->Faces();
-        for (std::size_t index = 0; index < faces.size(); ++index)
-        {
-            RCLCPP_INFO(get_logger(), "  face=%d xyz_world=(%.3f, %.3f, %.3f) yaw=%.1fdeg",
-                        static_cast<std::int32_t>(index),
-                        faces[index].xyz.x(), faces[index].xyz.y(), faces[index].xyz.z(), faces[index].yaw_rad * 180.0 / M_PI);
-        }
-    }
-
-    // 当帧检测的板心（解 PnP 得到），与上面的预测对照
-    for (const algorithm::vision::DetectedArmor& armor : last_armors_)
-    {
-        const std::optional<std::array<cv::Point3f, 4>> object_points = algorithm::vision::MakeObjectPoints(armor.GetSize(), algorithm::vision::ArmorDimensions {});
-        const std::optional<algorithm::vision::ArmorPose> pose = object_points ? algorithm::vision::SolvePose(armor.GetCorners(), *object_points, *camera_) : std::nullopt;
-        if (pose)
-        {
-            RCLCPP_INFO(get_logger(), "  observed xyz_cam=(%.3f, %.3f, %.3f)", pose->tvec[0], pose->tvec[1], pose->tvec[2]);
-        }
     }
 
     window_frames_ = 0;
@@ -587,6 +686,8 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
     window_age_ms_ = 0.0;
     window_accepted_ = 0;
     window_pose_missing_ = 0;
+    window_stats_ = algorithm::vision::ArmorDetectionStats {};
+    window_enemy_min_ = 0;
     window_pose_offset_sum_ = 0.0;
     window_pose_offset_min_ = 0.0;
     window_pose_offset_max_ = 0.0;

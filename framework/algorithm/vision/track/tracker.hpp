@@ -44,7 +44,8 @@ enum class ResetReason : std::uint8_t
     None,                                           // 本周期没有发生重建
     Nis,                                            // NIS 失败率超过阈值
     Diverged,                                       // 半径或第二半径跑出物理范围
-    InitFailed                                      // lost 下当帧观测建不起目标
+    InitFailed,                                     // lost 下当帧观测建不起目标
+    Manual                                          // 外部要求强制重置（松开自瞄键）
 };
 
 /**
@@ -52,16 +53,17 @@ enum class ResetReason : std::uint8_t
  */
 struct TrackerConfig
 {
-    VehicleEKFConfig vehicle {};                         // 单个目标的滤波器参数
+    VehicleEKFConfig vehicle {};                    // 单个目标的滤波器参数
     AssociationConfig  association {};              // 四门关联参数
     int32_t min_detect_count {5};                   // detecting 升 tracking 的连续确认帧数
     int32_t max_temp_lost_count {25};               // temp_lost 回 lost 的连续丢帧数
     double nis_failure_ratio {0.8};                 // NIS 失败率超过它就判丢（参考 100 帧里 80 次）
 
-    // 选面打分权重：score = w_center·中心距离² + w_cost·关联代价² + w_angle·视线夹角²，取最小
-    double aim_weight_center {1.0};                 // 检测框中心到画面中心的像素距离
+    // 选面打分：score = w_center·(d/fx)² + w_cost·代价² + w_angle·夹角² +（非当前面时）换面损失
+    double aim_weight_center {1.0};                 // 检测框中心到画面中心的归一化距离
     double aim_weight_cost {1.0};                   // 这对匹配的四门代价
     double aim_weight_angle {1.0};                  // 板法向与视线的夹角
+    double aim_switch_cost {1.0};                   // 换面损失，量纲与关联代价相同（1.0 ≈ 一次刚好卡在门限上的关联）
 };
 
 /**
@@ -105,6 +107,23 @@ public:
     }
 
     void ProcessFrame(const std::vector<DetectedArmor>& armors, const ArmorDimensions& dimensions, const CameraModel& camera, const FrameTransform& frame, double dt_s);
+
+    /**
+     * @brief 丢弃当前目标并回到 lost
+     *
+     * 下一帧处于 lost，会重新按 `FindLockArmor` 选板锁定，可以换成另一辆车。
+     * 本来就是 lost 时不再重复计数，松键期间每帧调用也只算一次重建。
+     *
+     * @param reason 记录到 `last_reset_reason` 的原因
+     */
+    void Reset(ResetReason reason)
+    {
+        if (report_.state == TrackerState::Lost)
+        {
+            return;
+        }
+        ResetVehicle(reason);
+    }
 
     /**
      * @brief 只按 dt 推进状态，不修正
@@ -155,6 +174,14 @@ public:
     }
 
     /**
+     * @brief 锁定时的机器人编号，用于核对候选筛选
+     */
+    ArmorLabel Label() const
+    {
+        return label_;
+    }
+
+    /**
      * @brief 当前 NIS 失败率，供日志判断离判丢还有多远
      */
     double NisFailureRate() const
@@ -189,7 +216,9 @@ private:
 
     void ResetVehicle(ResetReason reason);
 
-    int32_t SelectAimMatch(const std::vector<ArmorMatch>& matches, const ArmorDimensions& dimensions, const CameraModel& camera, double* score) const;
+    std::int32_t SelectAimMatch(const std::vector<ArmorMatch>& matches, const ArmorDimensions& dimensions, const CameraModel& camera) const;
+
+    double AimMatchScore(const ArmorMatch& match, const ArmorDimensions& dimensions, const CameraModel& camera) const;
 
     TrackerConfig config_;
     VehicleEKF  vehicle_;

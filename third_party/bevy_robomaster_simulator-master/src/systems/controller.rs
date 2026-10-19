@@ -4,6 +4,7 @@ use core::time::Duration;
 use std::sync::atomic::Ordering;
 
 use crate::components::SubscribeAutoAim;
+use crate::ros2::topic::{AutoAimTopic, TopicPublisher};
 
 const GAMEPAD_STICK_DEADZONE: f32 = 0.12;
 const GAMEPAD_TRIGGER_THRESHOLD: f32 = 0.35;
@@ -352,6 +353,7 @@ pub fn sample_gamepad_controller(
 pub fn update_auto_aim_subscription(
     controller: Res<ControllerState>,
     enabled: Res<SubscribeAutoAim>,
+    publisher: Option<Res<TopicPublisher<AutoAimTopic>>>,
 ) {
     let active = controller.auto_aim_active();
     if enabled.swap(active, Ordering::AcqRel) != active {
@@ -359,6 +361,9 @@ pub fn update_auto_aim_subscription(
             "Auto-aim subscription is now {}.",
             if active { "ENABLED" } else { "DISABLED" }
         );
+        if let Some(publisher) = publisher {
+            publisher.publish(r2r::std_msgs::msg::Bool { data: active });
+        }
     }
 }
 

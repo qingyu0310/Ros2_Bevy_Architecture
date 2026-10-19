@@ -135,6 +135,24 @@ public:
     }
 
     /**
+     * @brief 旋转中心在跟踪系的分量，单位 m
+     */
+    double CenterX() const
+    {
+        return filter_.state()[kCenterX];
+    }
+
+    double CenterY() const
+    {
+        return filter_.state()[kCenterY];
+    }
+
+    double CenterZ() const
+    {
+        return filter_.state()[kCenterZ];
+    }
+
+    /**
      * @brief 角速度估计，单位 rad/s
      */
     double Omega() const

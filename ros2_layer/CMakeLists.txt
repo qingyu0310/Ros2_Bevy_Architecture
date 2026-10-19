@@ -9,7 +9,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(rm_interfaces REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui imgcodecs)
 find_package(framework REQUIRED)
 
 # ============================================================================
@@ -35,7 +35,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     ${sensor_msgs_TARGETS}
     ${std_msgs_TARGETS}
     ${geometry_msgs_TARGETS}
-    opencv_core opencv_imgproc opencv_highgui
+    opencv_core opencv_imgproc opencv_highgui opencv_imgcodecs
     tf2_ros::tf2_ros
     ${tf2_msgs_TARGETS}
     rm_interfaces::rm_interfaces__rosidl_typesupport_cpp

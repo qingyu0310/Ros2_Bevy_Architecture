@@ -129,7 +129,8 @@ void AimPublisher::Publish(const std_msgs::msg::Header& header, const Tracker& t
 /**
  * @brief 选瞄准点，返回相机系坐标；没有收敛目标时为空
  *
- * 只取本帧实际观测到的面：r/l/h 不稳定时，外推出来的面会跑到车心另一侧甚至相机背后。
+ * 面序由跟踪器按参考 `choose_aim_point` 选好（锁定 + 角度判据），这里只取那个面的位置。
+ * 该面本帧可能没有观测，位置由整车状态外推。
  *
  * @param tracker 跟踪器
  * @param frame 当帧相机 → map 的位姿
@@ -142,14 +143,15 @@ std::optional<Eigen::Vector3d> AimPublisher::SelectAimPointCamera(const Tracker&
         return std::nullopt;
     }
 
-    const std::int32_t observed_face = tracker.Report().last_face;
+    // last_face 是选面结果：跟踪器见过多面之后，它可能是本帧没有观测、由状态外推的面
+    const std::int32_t aim_face = tracker.Report().last_face;
     const std::vector<FaceState> faces = tracker.Faces();
-    if (!frame || observed_face < 0 || static_cast<std::size_t>(observed_face) >= faces.size())
+    if (!frame || aim_face < 0 || static_cast<std::size_t>(aim_face) >= faces.size())
     {
         return std::nullopt;
     }
 
-    const Eigen::Vector3d aim = FrameToCamera(faces[static_cast<std::size_t>(observed_face)].xyz, *frame);
+    const Eigen::Vector3d aim = FrameToCamera(faces[static_cast<std::size_t>(aim_face)].xyz, *frame);
 
     // 必须在相机前方且距离合理；否则 atan2 会给出朝天或朝后的角，云台会直接甩飞
     if (!aim.allFinite() || aim.z() <= 0.1 || aim.norm() > config_.distance_max_m)

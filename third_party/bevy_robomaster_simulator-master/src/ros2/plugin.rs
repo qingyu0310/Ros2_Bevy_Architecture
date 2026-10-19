@@ -11,9 +11,8 @@ use crate::ros2::livox::{RosLivoxContext, RosLivoxPlugin};
 use crate::ros2::prelude::AverageRateLimiter;
 use crate::ros2::prelude::transform;
 use crate::ros2::topic::*;
-use crate::systems::{GimbalAimTarget, GimbalAimTracker, projectile_launch};
+use crate::systems::{GimbalAimTarget, GimbalAimTracker};
 use crate::util::entity_query::HierarchyQuery;
-use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 use bevy::image::BevyDefault;
 use bevy::render::render_resource::TextureFormat;
@@ -47,9 +46,6 @@ struct SpinThreadHandle(Option<JoinHandle<()>>);
 
 #[derive(Resource, Deref, DerefMut)]
 pub struct RoboMasterClock(pub Arc<Mutex<Clock>>);
-
-#[derive(Resource, Deref, DerefMut)]
-struct FireRateLimiter(AverageRateLimiter);
 
 #[derive(Resource, Deref, DerefMut)]
 struct TechCoreStateRateLimiter(AverageRateLimiter);
@@ -292,10 +288,8 @@ fn capture_rune(
 }
 
 fn process_subscription(
-    time: Res<Time>,
     mut commands: Commands,
     gimbal_cmd: ResMut<TopicSubscriber<GimbalCmdTopic>>,
-    mut fire_rate_limiter: ResMut<FireRateLimiter>,
     enabled: Res<SubscribeAutoAim>,
     gimbal: Single<
         (Entity, Option<&mut GimbalAimTracker>),
@@ -308,7 +302,6 @@ fn process_subscription(
     >,
 ) {
     let (gimbal_entity, mut tracker) = gimbal.into_inner();
-    fire_rate_limiter.tick(time.delta());
     loop {
         let Ok(Some(cmd)) = gimbal_cmd.try_recv() else {
             return;
@@ -323,13 +316,7 @@ fn process_subscription(
             commands.entity(gimbal_entity).remove::<GimbalAimTracker>();
             continue;
         }
-        if cmd.fire_advice {
-            if fire_rate_limiter.allow() {
-                commands.queue(|w: &mut World| {
-                    w.run_system_once(projectile_launch).unwrap();
-                });
-            }
-        }
+        // 自瞄接管期间不发射：视觉下发的 fire_advice 只当诊断量，不驱动弹药
 
         match tracker.as_mut() {
             Some(tracker) => tracker.retarget(target),
@@ -435,7 +422,6 @@ impl Plugin for ROS2Plugin {
 
         app.insert_resource(RoboMasterClock(clock.clone()))
             .insert_resource(StopSignal(signal_arc.clone()))
-            .insert_resource(FireRateLimiter(AverageRateLimiter::from_hz(10.0)))
             .insert_resource(TechCoreStateRateLimiter(AverageRateLimiter::from_hz(20.0)))
             .add_plugins(RosCapturePlugin {
                 config: color_capture_config,

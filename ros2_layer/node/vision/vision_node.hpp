@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include <std_msgs/msg/bool.hpp>
+
 #include <Eigen/Geometry>
 #include <opencv2/core.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -77,6 +79,9 @@ private:
         double aim_fire_angle_deg {1.5};                        // 目标偏离光轴小于它才给 fire_advice
         double aim_distance_max_m {8.0};                        // 超过这个距离不给 fire_advice
         std::string aim_fixed_yaw_pitch;                        // 形如 "30,80" 时忽略解算，恒发这组绝对角；空表示正常自瞄
+        std::string auto_aim_topic {"/simulator/auto_aim"};     // 仿真发的自瞄键状态，true 表示按住
+        std::string drop_dump_dir {"/tmp/vision_drop"};         // 漏检帧落盘目录，调大根目录便于事后看图
+        std::int32_t drop_dump_limit {20};                      // 最多存多少张漏检帧
 
         // 跟踪参数，与旧工程 YAML 的同名项一一对应
         std::int32_t armor_num {4};
@@ -106,11 +111,13 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr      image_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr info_sub_;
     rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr     tf_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr          auto_aim_sub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr         image_pub_;
 
     std::optional<algorithm::vision::CameraModel> camera_;      // 内参只从话题来，收到之前不处理图像
     std::optional<algorithm::vision::FrameTransform> frame_;    // 当帧相机→map 的位姿，跟踪与绘制共用
     std::optional<rclcpp::Time> last_stamp_;                    // 上一帧的 ROS 时间，用于跟踪 dt
+    bool auto_aim_pressed_ {false};                             // 自瞄键当前是否按住；松开的那一帧强制重锁
     std::vector<algorithm::vision::DetectedArmor> last_armors_; // 上一帧检测结果，日志对照用
 
     void read_parameters();
@@ -120,6 +127,8 @@ private:
     void on_image(const sensor_msgs::msg::Image& msg);
 
     void on_tf(const tf2_msgs::msg::TFMessage& msg);
+
+    void on_auto_aim(const std_msgs::msg::Bool& msg);
 
     static algorithm::vision::FrameTransform MakeFrameTransform(const algorithm::vision::PoseSample& sample);
 
@@ -144,6 +153,11 @@ private:
     uint64_t window_frames_ {0};
     uint64_t window_accepted_ {0};
     uint64_t window_pose_missing_ {0};
+    algorithm::vision::ArmorDetectionStats window_stats_ {};   // 本秒逐级检测计数累加
+    std::size_t window_enemy_min_ {0};                        // 本秒敌方颜色检测数的最小值，0 表示还没统计
+    std::size_t last_enemy_count_ {0};                        // 上一帧的敌方装甲数，用于发现单帧漏检
+    std::int32_t detect_drops_ {0};                           // 累计漏检帧数，也用作落盘文件序号
+    std::int32_t last_face_seen_ {-1};                        // 上一帧的瞄准面，用于打印换面现场
     double   window_pose_offset_sum_ {0.0};                // 每秒累计的图像时刻 − 最新姿态时刻
     double   window_pose_offset_min_ {0.0};                // 本秒最小偏移，单位 s
     double   window_pose_offset_max_ {0.0};                // 本秒最大偏移，单位 s

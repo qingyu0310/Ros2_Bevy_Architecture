@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <opencv2/calib3d.hpp>
 
 namespace algorithm::vision
@@ -162,8 +163,8 @@ bool Tracker::UpdateVehicle(const std::vector<DetectedArmor>& armors, const Armo
     // 单板无法约束 r/l/h，只有本帧匹配到至少两个面时才把它们放进观测
     const bool estimate_shape = association.matches.size() >= 2;
 
-    // 瞄准面按三项加权分选，与修正顺序无关；matches 的升序排列只影响 EKF 修正次序
-    const std::int32_t aim_index = SelectAimMatch(association.matches, dimensions, camera, nullptr);
+    // 瞄准面带换面损失：当前面仍可匹配时，别的面要好出一整个罚值才抢得走
+    const std::int32_t aim_index = SelectAimMatch(association.matches, dimensions, camera);
 
     std::int32_t matched_count = 0;
     for (std::size_t index = 0; index < association.matches.size(); ++index)
@@ -190,11 +191,11 @@ bool Tracker::UpdateVehicle(const std::vector<DetectedArmor>& armors, const Armo
 /**
  * @brief 本帧选哪一对匹配作为瞄准面
  *
- * 三项各自量纲不同（像素距离、无量纲代价、弧度），这里按权重直接加权，靠调权重决定主导项：
- * `score = w_center·中心距离² + w_cost·代价² + w_angle·夹角²`，取最小。夹角与代价都取自这块板
- * 自己的 PnP 位姿，解不出来时该项记为 0，只用另外两项。
+ * 每个候选按 `AimMatchScore` 打分，不是当前瞄准面（按 face 对齐，不是匹配序号）的再加
+ * `aim_switch_cost`。当前面仍在本帧匹配里时，别的面必须好出一整个换面损失才抢得走；
+ * 当前面丢了就直接选分最低的那个，不加罚值。
  */
-std::int32_t Tracker::SelectAimMatch(const std::vector<ArmorMatch>& matches, const ArmorDimensions& dimensions, const CameraModel& camera, double* score) const
+std::int32_t Tracker::SelectAimMatch(const std::vector<ArmorMatch>& matches, const ArmorDimensions& dimensions, const CameraModel& camera) const
 {
     std::int32_t selected = -1;
     double selected_score = std::numeric_limits<double>::max();
@@ -202,43 +203,50 @@ std::int32_t Tracker::SelectAimMatch(const std::vector<ArmorMatch>& matches, con
     for (std::size_t index = 0; index < matches.size(); ++index)
     {
         const ArmorMatch& match = matches[index];
-        const cv::Point2f image_center(static_cast<float>(camera.cx), static_cast<float>(camera.cy));
-        const double center_distance = cv::norm(match.armor->GetCenter() - image_center);
-
-        // 夹角用的是这块板自己的 PnP 法向与视线；板越正对相机，单板解出的位姿越可信
-        double view_angle_rad = 0.0;
-        const std::optional<std::array<cv::Point3f, 4>> object_points = MakeObjectPoints(match.armor->GetSize(), dimensions);
-        if (object_points)
-        {
-            const std::optional<ArmorPose> pose = SolvePose(match.armor->GetCorners(), *object_points, camera);
-            if (pose)
-            {
-                const Eigen::Vector3d center(pose->tvec[0], pose->tvec[1], pose->tvec[2]);
-                if (center.norm() > 0.0)
-                {
-                    cv::Matx33d rotation;
-                    cv::Rodrigues(cv::Mat(pose->rvec), rotation);
-                    const Eigen::Vector3d normal_camera(rotation(0, 0), rotation(1, 0), rotation(2, 0));
-                    const double facing_cos = std::abs(normal_camera.dot(center.normalized()));
-                    view_angle_rad = std::acos(std::clamp(facing_cos, 0.0, 1.0));
-                }
-            }
-        }
-
-        const double candidate_score = config_.aim_weight_center * center_distance * center_distance + config_.aim_weight_cost * match.cost * match.cost +
-                                       config_.aim_weight_angle  * view_angle_rad  * view_angle_rad;
-        if (candidate_score < selected_score)
+        const double score = AimMatchScore(match, dimensions, camera) + (match.face == report_.last_face ? 0.0 : config_.aim_switch_cost);
+        if (score < selected_score)
         {
             selected = static_cast<std::int32_t>(index);
-            selected_score = candidate_score;
+            selected_score = score;
         }
     }
 
-    if (score != nullptr)
-    {
-        *score = selected >= 0 ? selected_score : 0.0;
-    }
     return selected;
+}
+
+/**
+ * @brief 一对匹配的瞄准打分
+ *
+ * 中心距离按 fx 归一化，使三项都落在同一量级；否则像素平方项会让中心项独大。
+ */
+double Tracker::AimMatchScore(const ArmorMatch& match, const ArmorDimensions& dimensions, const CameraModel& camera) const
+{
+    const cv::Point2f image_center(static_cast<float>(camera.cx), static_cast<float>(camera.cy));
+    const double center_distance = cv::norm(match.armor->GetCenter() - image_center);
+
+    // 夹角用的是这块板自己的 PnP 法向与视线；板越正对相机，单板解出的位姿越可信
+    double view_angle_rad = 0.0;
+    const std::optional<std::array<cv::Point3f, 4>> object_points = MakeObjectPoints(match.armor->GetSize(), dimensions);
+    if (object_points)
+    {
+        const std::optional<ArmorPose> pose = SolvePose(match.armor->GetCorners(), *object_points, camera);
+        if (pose)
+        {
+            const Eigen::Vector3d center(pose->tvec[0], pose->tvec[1], pose->tvec[2]);
+            if (center.norm() > 0.0)
+            {
+                cv::Matx33d rotation;
+                cv::Rodrigues(cv::Mat(pose->rvec), rotation);
+                const Eigen::Vector3d normal_camera(rotation(0, 0), rotation(1, 0), rotation(2, 0));
+                const double facing_cos = std::abs(normal_camera.dot(center.normalized()));
+                view_angle_rad = std::acos(std::clamp(facing_cos, 0.0, 1.0));
+            }
+        }
+    }
+
+    const double normalized_distance = center_distance / std::max(camera.fx, 1.0);
+    return config_.aim_weight_center * normalized_distance * normalized_distance + config_.aim_weight_cost * match.cost * match.cost +
+           config_.aim_weight_angle  * view_angle_rad  * view_angle_rad;
 }
 
 /**

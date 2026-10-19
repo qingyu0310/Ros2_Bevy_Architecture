@@ -38,6 +38,13 @@
     aim_distance_max_m: 8.0
     # 标定用：形如 "30,80" 时忽略解算、恒发这组绝对角（yaw,pitch）；留空正常自瞄
     aim_fixed_yaw_pitch: ""
+    # 仿真发来的自瞄键状态（std_msgs/Bool，true=按住）。松开的那一帧强制重置车型，
+    # 下一帧按画面中心重新选板，不用等旧目标离开视野
+    auto_aim_topic: "/simulator/auto_aim"
+    # 目标从两块掉成一块时，把那一帧原图存下来的目录。调大：换到别的盘
+    drop_dump_dir: "/tmp/vision_drop"
+    # 最多存多少张漏检帧；调到 0：不落盘。目录要存在，节点启动时会自己建
+    drop_dump_limit: 20
 
     # ---- 跟踪 ----
     # 整车面数；四面车为 4
@@ -74,7 +81,7 @@
     corner_gate_px: 140.0
 
     # 面关联：四条边方向角差之和上限，单位 rad
-    angle_gate_rad: 0.8
+    angle_gate_rad: 1.5
 
     # 面关联：预测与实际周长的相对差上限
     perimeter_ratio_gate: 0.6
@@ -82,7 +89,7 @@
     # NIS 失败率上限，超过就判丢。调大：更容忍模型误差；调小：异常帧更快丢目标
     nis_failure_ratio: 0.8
 
-    # 瞄准面打分：score = w_center·中心距离² + w_cost·代价² + w_angle·夹角²，取最小的一对
+    # 瞄准面打分：score = w_center·(d/fx)² + w_cost·代价² + w_angle·夹角² +（非当前面时）换面损失，取最小
     # 中心距离权重。调大：更偏向画面中心的板
     aim_weight_center: 1.0
 
@@ -90,7 +97,10 @@
     aim_weight_cost: 1.0
 
     # 视线夹角权重。调大：更偏向正对相机的板
-    aim_weight_angle: 1.0
+    aim_weight_angle: 1.5
+
+    # 换面损失：不是当前瞄准面的板，打分一律加这个罚值。调大：更不愿意换板；调到 0：每帧重新挑最好的
+    aim_switch_cost: 5.0
 
     # ---- 可视化 ----
     # 是否开 OpenCV 窗口。无桌面或远程调试时关掉，改用 rqt_image_view 看 /vision/debug_image
