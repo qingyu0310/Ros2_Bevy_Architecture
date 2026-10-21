@@ -431,6 +431,27 @@ bool VehicleEKF::UpdateImagePoints(const std::array<cv::Point2f, 4>& corners, Ar
 
     const State before_correct = filter_.state();
 
+    // 残差 RMS：修正前"观测 − 预测"的逐点均方根，单位 pixel。
+    // 它和 NIS 一起看才能分清模型问题与状态问题：
+    //   NIS 大 + 残差大 → 状态偏了；NIS 大 + 残差正常 → 协方差假设过紧；
+    //   NIS 小 + 残差大 → 观测噪声给得过大，观测被浪费。
+    {
+        const Measure predicted_measure = [&]()
+        {
+            Measure projected(8);
+            const std::optional<std::array<cv::Point2f, 4>> points = ObservePoints(before_correct, size, dimensions, camera, frame, face);
+            for (std::size_t index = 0; index < points->size(); ++index)
+            {
+                projected[2 * index]     = (*points)[index].x;
+                projected[2 * index + 1] = (*points)[index].y;
+            }
+            return projected;
+        }();
+
+        const Measure residual = measured - predicted_measure;
+        residual_rms_px_ = std::sqrt(residual.squaredNorm() / static_cast<double>(residual.size()));
+    }
+
     Filter::MeasureMatrix measurement_noise = Filter::MeasureMatrix::Identity(8, 8) * config_.point_sigma_px * config_.point_sigma_px;
     filter_.set_measurement_noise(measurement_noise);
 
@@ -456,6 +477,18 @@ bool VehicleEKF::UpdateImagePoints(const std::array<cv::Point2f, 4>& corners, Ar
     shape_radius_step_      = after_correct[kRadius] - before_correct[kRadius];
     shape_radius_gap_step_  = after_correct[kRadiusGap] - before_correct[kRadiusGap];
     shape_height_gap_step_  = after_correct[kHeightGap] - before_correct[kHeightGap];
+
+    // 单板帧冻结形状量：r 不在这帧的雅可比里，但修正 x 时协方差的相关性仍会把它带走。
+    // 单板观测无法区分"板绕车心转"和"车心平移"，放开 r 就等于允许两者互相顶账。
+    // 这里把 r/l/h 强行写回修正前的值（协方差保留，后续多板帧仍能修正它们）。
+    if (!estimate_shape)
+    {
+        State frozen = filter_.state();
+        frozen[kRadius]     = before_correct[kRadius];
+        frozen[kRadiusGap]  = before_correct[kRadiusGap];
+        frozen[kHeightGap]  = before_correct[kHeightGap];
+        filter_.set_state(frozen, filter_.covariance());
+    }
 
     return filter_.state().allFinite() && filter_.covariance().allFinite();
 }
@@ -517,11 +550,12 @@ void VehicleEKF::Initialize(const std::array<cv::Point2f, 4>& corners, ArmorSize
     state[kAngle]   = yaw;
     state[kRadius]  = radius;
 
-    // 初值不确定度：位置 ±0.1 m、角度 ±0.3 rad、半径 ±0.2 m；速度未知但量级小，
-    // 给 0.01（std 0.1 m/s）——给太大（如 1.0）会让滤波器把弧线运动解释成平移而不修半径。
+    // 初值不确定度取参考 `set_target` 的普通车取值：位置 1 m、速度 8 m/s、角度 36°、
+    // 角速度 10 rad/s、半径 1 m。原来给的是 ω σ=0.5 rad/s，而目标实际转速 7.4 rad/s，
+    // 差 15σ，锁定时只能靠后续观测慢慢把 ω 从 0 拉上去，这段过程会被解释成车心平移。
     // 与参考一致只给对角阵：中心与半径的相关性由后续观测学，不预先写入
     StateMat covariance = StateMat::Zero();
-    covariance.diagonal() << 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.09, 0.25, 0.04, 0.01, 0.01;
+    covariance.diagonal() << 1.0, 64.0, 1.0, 64.0, 1.0, 64.0, 0.4, 100.0, 1.0, 1.0, 1.0;
 
     filter_.set_state(state, covariance);
 
@@ -645,6 +679,7 @@ VehicleEKF::Snapshot VehicleEKF::DebugSnapshot() const
     }
     snapshot.image_updates = image_updates_;
     snapshot.ypda_updates  = ypda_updates_;
+    snapshot.residual_rms_px = residual_rms_px_;
     snapshot.limit_clamps  = limit_clamps_;
     snapshot.shape_radius_step      = shape_radius_step_;
     snapshot.shape_radius_gap_step  = shape_radius_gap_step_;

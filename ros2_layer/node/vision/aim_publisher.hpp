@@ -36,6 +36,12 @@ struct AimPublisherConfig
     std::string camera_frame {"camera_optical_frame"}; // 图像所在坐标系
     double fire_angle_deg {1.5};                    // 开火允许的 pitch 偏差，单位度
     double distance_max_m {8.0};                    // 可视与开火距离上限，单位 m
+
+    // 瞄准面选择，照参考 `Planner::choose_aim_point` 的三个角
+    double aim_sector_deg {60.0};                   // 慢转时算"可射击"的扇区半角，单位度
+    double coming_angle_deg {55.0};                 // 小陀螺时开始考虑的角，单位度（参考 55）
+    double leaving_angle_deg {20.0};                // 小陀螺时"将要离开"的界，单位度（参考 20）
+    double spin_omega_threshold {2.0};              // |ω| 低于它按慢转处理，单位 rad/s
     std::string fixed_yaw_pitch;                    // 非空时忽略解算，恒发这组绝对角
     double fixed_yaw_deg {0.0};                     // 上面解析出的 yaw
     double fixed_pitch_deg {0.0};                   // 上面解析出的 pitch
@@ -69,8 +75,32 @@ public:
      */
     void Publish(const std_msgs::msg::Header& header, const Tracker& tracker, const std::optional<FrameTransform>& frame, const Eigen::Vector3d& gimbal_in_map);
 
+    /**
+     * @brief 最近一次选中的瞄准面序，-1 表示没有可选面
+     */
+    std::int32_t aim_face() const
+    {
+        return aim_face_;
+    }
+
 private:
+    /**
+     * @brief 从整车四个预测面里选一个可射击的面
+     *
+     * 照参考 `Planner::choose_aim_point`：按 `delta = 该面法向角 − 车心相对云台的方位角`
+     * 判断哪个面朝向自己。慢转时在扇区内选并加锁防止两块板之间来回跳；小陀螺时选
+     * "将要转出视野"的那一块，提前量才有意义。
+     *
+     * @param tracker 跟踪器，提供四面状态与角速度
+     * @param gimbal_in_map 云台原点在 map 中的位置，车心方位角从这里量
+     * @return 面序；无目标或四面都不可射击时返回 -1
+     */
+    std::int32_t SelectAimFace(const Tracker& tracker, const Eigen::Vector3d& gimbal_in_map);
+
     std::optional<Eigen::Vector3d> SelectAimPointCamera(const Tracker& tracker, const std::optional<FrameTransform>& frame) const;
+
+    std::int32_t aim_face_ {-1};                    // 本帧选中的瞄准面序
+    std::int32_t aim_lock_id_ {-1};                 // 慢转时的锁定面序，-1 表示未锁定
 
     static Eigen::Quaterniond ToEigen(const geometry_msgs::msg::Quaternion& value);
 

@@ -29,13 +29,23 @@
     # 图像所在的坐标系；与 aim_frame 一起选出要缓存的那条 TF
     camera_frame: "camera_optical_frame"
     # 图像时间戳晚于最后一条姿态样本时，最多用最后一条顶替多久，单位 s。调大：更少跳帧，但姿态更旧
-    pose_hold_s: 0.03
+    # 实测 pose offset 最大 65 ms，0.03 兜不住会整帧丢弃，丢掉又让下一帧 dt 变大
+    pose_hold_s: 0.08
     # 敌方颜色：red / blue。只有这个颜色的装甲板会进跟踪器；己方同号车不会被误跟
     enemy_color: "blue"
     # 目标偏离光轴小于它才给 fire_advice，单位度；调大：更容易开火
     aim_fire_angle_deg: 1.5
     # 超过这个距离不给 fire_advice，单位 m
     aim_distance_max_m: 8.0
+    # 瞄准面扇区半角，单位度。车心朝向我们的那一面法向与视线夹角小于它才算可射击。
+    # 调大：可选面更多但可能选到侧对相机的板；调小：只打正对的板
+    aim_sector_deg: 60.0
+    # 小陀螺时开始考虑的面，单位度（参考 standard3.yaml 的 comming_angle）
+    coming_angle_deg: 55.0
+    # 小陀螺时"将要转出"的界，单位度（参考 standard3.yaml 的 leaving_angle）。调小：更偏打正中
+    leaving_angle_deg: 20.0
+    # |ω| 低于它按慢转处理，单位 rad/s。调大：更快进小陀螺分支
+    spin_omega_threshold: 2.0
     # 标定用：形如 "30,80" 时忽略解算、恒发这组绝对角（yaw,pitch）；留空正常自瞄
     aim_fixed_yaw_pitch: ""
     # 仿真发来的自瞄键状态（std_msgs/Bool，true=按住）。松开的那一帧强制重置车型，
@@ -54,7 +64,8 @@
     radius_init_m: 0.2
 
     # 四点观测噪声基准，单位 pixel。调大：更不信观测，平滑但迟钝；调小：跟得紧但抖
-    point_sigma_px: 8.0
+    # 按 NIS 自洽点定：σ=2 时 NIS≈40，σ=8 时 NIS≈0.15，取 4.0 让 NIS 落到期望值 8 附近
+    point_sigma_px: 4.0
 
     # 板法向角的先验标准差，单位 rad。调大：更信 PnP 解出的法向；调小：法向更稳但迟钝
     angle_prior_rad: 0.15

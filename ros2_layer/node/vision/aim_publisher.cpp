@@ -11,9 +11,13 @@
 
 #include "ros2_layer/node/vision/aim_publisher.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include <tf2/exceptions.h>
+
+#include "framework/algorithm/math/angle.hpp"
 
 namespace algorithm::vision
 {
@@ -55,6 +59,14 @@ void AimPublisher::Publish(const std_msgs::msg::Header& header, const Tracker& t
         cmd.yaw = config_.fixed_yaw_deg;
         cmd.pitch = config_.fixed_pitch_deg;
         cmd.distance = 2.0;
+        publisher_->publish(cmd);
+        return;
+    }
+
+    // 先从四个预测面里选一个可射击的，再取它的相机系坐标；选不出来就发空指令
+    aim_face_ = SelectAimFace(tracker, gimbal_in_map);
+    if (aim_face_ < 0)
+    {
         publisher_->publish(cmd);
         return;
     }
@@ -109,19 +121,10 @@ void AimPublisher::Publish(const std_msgs::msg::Header& header, const Tracker& t
         return;
     }
 
-    const Eigen::Vector3d target_in_map = input.map_from_camera * input.aim_camera + input.camera_in_map;
-    const Eigen::Vector3d direction_in_map = target_in_map - input.gimbal_in_map;
-
     cmd.yaw = solution->yaw_deg;
     cmd.pitch = solution->pitch_deg;
     cmd.distance = solution->distance_m;
     cmd.fire_advice = solution->fire_advice;
-
-    RCLCPP_INFO(node_.get_logger(), "aim cmd yaw=%.2f pitch=%.2f dist=%.3f fire=%d | target_map=(%.3f, %.3f, %.3f) gimbal_world=(%.3f, %.3f, %.3f) dir_map=(%.3f, %.3f, %.3f)",
-                cmd.yaw, cmd.pitch, cmd.distance, cmd.fire_advice ? 1 : 0,
-                target_in_map.x(), target_in_map.y(), target_in_map.z(),
-                input.gimbal_in_map.x(), input.gimbal_in_map.y(), input.gimbal_in_map.z(),
-                direction_in_map.x(), direction_in_map.y(), direction_in_map.z());
 
     publisher_->publish(cmd);
 }
@@ -136,6 +139,107 @@ void AimPublisher::Publish(const std_msgs::msg::Header& header, const Tracker& t
  * @param frame 当帧相机 → map 的位姿
  * @return 瞄准点；无收敛目标、面序无效或点在相机后方时为空
  */
+std::int32_t AimPublisher::SelectAimFace(const Tracker& tracker, const Eigen::Vector3d& gimbal_in_map)
+{
+    // 目标没了就把锁定状态一起清掉，下次锁定重新挑面
+    if (!tracker.Active())
+    {
+        aim_lock_id_ = -1;
+        return -1;
+    }
+
+    const std::vector<FaceState> faces = tracker.Faces();
+    if (faces.empty())
+    {
+        aim_lock_id_ = -1;
+        return -1;
+    }
+
+    const VehicleEKF::Snapshot snapshot = tracker.DebugSnapshot();
+    const Eigen::Vector3d center = snapshot.center;
+
+    // 车心与云台重合时方位角没有定义，直接放弃这一帧
+    const Eigen::Vector2d offset(center.x() - gimbal_in_map.x(), center.y() - gimbal_in_map.y());
+    if (!offset.allFinite() || offset.norm() < 0.3)
+    {
+        aim_lock_id_ = -1;
+        return -1;
+    }
+
+    // 车心相对云台的方位角：朝向我们的那一面，法向（指向车心）与它同向
+    const double center_yaw = std::atan2(offset.y(), offset.x());
+
+    const std::size_t face_count = faces.size();
+    std::vector<double> delta(face_count, 0.0);
+    for (std::size_t index = 0; index < face_count; ++index)
+    {
+        delta[index] = algorithm::math::normalize_radian_pm_pi(faces[index].yaw_rad - center_yaw);
+    }
+
+    constexpr double kDegToRad = M_PI / 180.0;
+    const double omega = snapshot.omega_rad_s;
+
+    // 慢转：只在一个扇区里挑，两块板同时卡在扇区边上时靠锁存防止来回跳
+    if (std::abs(omega) <= config_.spin_omega_threshold)
+    {
+        const double sector = config_.aim_sector_deg * kDegToRad;
+
+        std::vector<std::int32_t> candidates;
+        for (std::size_t index = 0; index < face_count; ++index)
+        {
+            if (std::abs(delta[index]) <= sector)
+            {
+                candidates.push_back(static_cast<std::int32_t>(index));
+            }
+        }
+
+        if (candidates.empty())
+        {
+            aim_lock_id_ = -1;
+            return -1;
+        }
+
+        if (candidates.size() > 1)
+        {
+            const std::int32_t first = candidates[0];
+            const std::int32_t second = candidates[1];
+            const bool locked_on_candidate = (aim_lock_id_ == first || aim_lock_id_ == second);
+            if (!locked_on_candidate)
+            {
+                aim_lock_id_ = (std::abs(delta[first]) < std::abs(delta[second])) ? first : second;
+            }
+            return aim_lock_id_;
+        }
+
+        aim_lock_id_ = -1;
+        return candidates.front();
+    }
+
+    // 小陀螺：一侧不断转出、另一侧不断转入，打"正要转出"的那一块命中概率更高
+    const double coming = config_.coming_angle_deg * kDegToRad;
+    const double leaving = config_.leaving_angle_deg * kDegToRad;
+    for (std::size_t index = 0; index < face_count; ++index)
+    {
+        if (std::abs(delta[index]) > coming)
+        {
+            continue;
+        }
+        if (omega > 0.0 && delta[index] < leaving)
+        {
+            aim_lock_id_ = -1;
+            return static_cast<std::int32_t>(index);
+        }
+        if (omega < 0.0 && delta[index] > -leaving)
+        {
+            aim_lock_id_ = -1;
+            return static_cast<std::int32_t>(index);
+        }
+    }
+
+    aim_lock_id_ = -1;
+    return -1;
+}
+
 std::optional<Eigen::Vector3d> AimPublisher::SelectAimPointCamera(const Tracker& tracker, const std::optional<FrameTransform>& frame) const
 {
     if (!tracker.Converged())
@@ -143,15 +247,14 @@ std::optional<Eigen::Vector3d> AimPublisher::SelectAimPointCamera(const Tracker&
         return std::nullopt;
     }
 
-    // last_face 是选面结果：跟踪器见过多面之后，它可能是本帧没有观测、由状态外推的面
-    const std::int32_t aim_face = tracker.Report().last_face;
+    // aim_face_ 是选面结果：可能是本帧没有观测、由状态外推的面
     const std::vector<FaceState> faces = tracker.Faces();
-    if (!frame || aim_face < 0 || static_cast<std::size_t>(aim_face) >= faces.size())
+    if (!frame || aim_face_ < 0 || static_cast<std::size_t>(aim_face_) >= faces.size())
     {
         return std::nullopt;
     }
 
-    const Eigen::Vector3d aim = FrameToCamera(faces[static_cast<std::size_t>(aim_face)].xyz, *frame);
+    const Eigen::Vector3d aim = FrameToCamera(faces[static_cast<std::size_t>(aim_face_)].xyz, *frame);
 
     // 必须在相机前方且距离合理；否则 atan2 会给出朝天或朝后的角，云台会直接甩飞
     if (!aim.allFinite() || aim.z() <= 0.1 || aim.norm() > config_.distance_max_m)

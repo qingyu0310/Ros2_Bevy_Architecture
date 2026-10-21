@@ -16,12 +16,16 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <unordered_map>
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+
+#include "framework/algorithm/math/angle.hpp"
 #include <tf2/exceptions.h>
 
 VisionNode::VisionNode(const rclcpp::NodeOptions& options) : rclcpp::Node("vision", options)
@@ -74,6 +78,10 @@ VisionNode::VisionNode(const rclcpp::NodeOptions& options) : rclcpp::Node("visio
         aim_config.camera_frame = params_.camera_frame;
         aim_config.fire_angle_deg = params_.aim_fire_angle_deg;
         aim_config.distance_max_m = params_.aim_distance_max_m;
+        aim_config.aim_sector_deg = params_.aim_sector_deg;
+        aim_config.coming_angle_deg = params_.coming_angle_deg;
+        aim_config.leaving_angle_deg = params_.leaving_angle_deg;
+        aim_config.spin_omega_threshold = params_.spin_omega_threshold;
         aim_config.fixed_yaw_pitch = params_.aim_fixed_yaw_pitch;
         aim_config.fixed_yaw_deg = fixed_yaw_deg_;
         aim_config.fixed_pitch_deg = fixed_pitch_deg_;
@@ -103,6 +111,10 @@ void VisionNode::read_parameters()
     params_.enemy_color        = declare_parameter("enemy_color", params_.enemy_color);
     params_.aim_fire_angle_deg = declare_parameter("aim_fire_angle_deg", params_.aim_fire_angle_deg);
     params_.aim_distance_max_m = declare_parameter("aim_distance_max_m", params_.aim_distance_max_m);
+    params_.aim_sector_deg = declare_parameter("aim_sector_deg", params_.aim_sector_deg);
+    params_.coming_angle_deg = declare_parameter("coming_angle_deg", params_.coming_angle_deg);
+    params_.leaving_angle_deg = declare_parameter("leaving_angle_deg", params_.leaving_angle_deg);
+    params_.spin_omega_threshold = declare_parameter("spin_omega_threshold", params_.spin_omega_threshold);
     params_.aim_fixed_yaw_pitch = declare_parameter("aim_fixed_yaw_pitch", params_.aim_fixed_yaw_pitch);
     params_.auto_aim_topic     = declare_parameter("auto_aim_topic", params_.auto_aim_topic);
     params_.drop_dump_dir      = declare_parameter("drop_dump_dir", params_.drop_dump_dir);
@@ -250,13 +262,20 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
     }
     // 图像时刻与缓冲里最近一条姿态的差：正数表示图像比姿态晚（用旧姿态），负数表示超窗
     window_pose_offset_sum_ += image_stamp - pose_latest;
+    // 插值跨度：At() 在这两条之间做 slerp，跨度越大插值越不可靠
+    if (pose_at_image && pose_latest > image_stamp)
+    {
+        window_pose_span_sum_ += pose_latest - image_stamp;
+        ++window_pose_span_count_;
+    }
     window_pose_offset_min_ = std::min(window_pose_offset_min_, image_stamp - pose_latest);
     window_pose_offset_max_ = std::max(window_pose_offset_max_, image_stamp - pose_latest);
     if (frame_)
     {
-        // 松开自瞄键时不跑跟踪：不选板、不锁车、不推进 EKF。否则松开期间会一直锁着
-        // 第一次按下的那辆车，下次按下还是它
-        if (auto_aim_pressed_)
+        // P0：把本帧检测和仿真真值配一次，量"配对本身对不对"，不参与跟踪
+        pair_armor_truth(enemy_armors, image_stamp);
+
+        // 无论自瞄键是否按住都跑跟踪：键只决定要不要把指令发给云台。
         {
             // dt 用距上一次真正推进跟踪器的时间：姿态缺失的帧整帧跳过，不推进也不记时间戳。
             // 用"距上一张图像"的话，丢一帧后下一帧只补一个图像间隔，实际过了两帧，
@@ -273,6 +292,38 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
             last_stamp_ = stamp;
             tracker_->ProcessFrame(enemy_armors, algorithm::vision::ArmorDimensions {}, *camera_, *frame_, dt_s);
 
+            // P4：车心漂移。锁定（状态从 lost 建起）时记起点，满 1 s 后算位移。
+            // 用 resets 计数判断"是不是新锁的"：重置后 tracker 回到 lost，下一次建目标就是新起点。
+            const algorithm::vision::TrackerReport& drift_report = tracker_->Report();
+            if (drift_report.state != algorithm::vision::TrackerState::Lost && drift_report.active)
+            {
+                if (!lock_center_)
+                {
+                    const algorithm::vision::VehicleEKF::Snapshot snapshot = tracker_->DebugSnapshot();
+                    lock_center_ = snapshot.center;
+                    lock_time_ = stamp;
+                }
+                else if (lock_time_)
+                {
+                    const double held = (stamp - *lock_time_).seconds();
+                    if (held >= 1.0)
+                    {
+                        const algorithm::vision::VehicleEKF::Snapshot snapshot = tracker_->DebugSnapshot();
+                        const double drift = (snapshot.center - *lock_center_).norm();
+                        ++window_drift_1s_count_;
+                        window_drift_1s_sum_ += drift;
+                        window_drift_max_ = std::max(window_drift_max_, drift);
+                        lock_center_.reset();
+                        lock_time_.reset();
+                    }
+                }
+            }
+            else
+            {
+                lock_center_.reset();
+                lock_time_.reset();
+            }
+
             // 换面现场：记下这一帧候选/匹配数与各次配对的门限分项，判断是关联只剩一条
             // 还是双板帧里打分换了面
             const std::int32_t face = tracker_->Report().last_face;
@@ -282,32 +333,8 @@ void VisionNode::on_image(const sensor_msgs::msg::Image& msg)
                 RCLCPP_INFO(get_logger(), "face switch %d -> %d kept=%zu candidates=%zu matches=%zu locked label=%d size=%d",
                             last_face_seen_, face, enemy_armors.size(), report.candidate_count, report.match_count,
                             static_cast<std::int32_t>(tracker_->Label()), static_cast<std::int32_t>(tracker_->Size()));
-                // 每块检测的身份：候选数比检测数少时，就是编号或尺寸对不上被筛掉了
-                for (const algorithm::vision::DetectedArmor& armor : enemy_armors)
-                {
-                    RCLCPP_INFO(get_logger(), "  kept label=%d raw_label=%d size=%d center=(%.0f, %.0f) conf=%.2f",
-                                static_cast<std::int32_t>(armor.GetLabel()), armor.GetRawLabelId(),
-                                static_cast<std::int32_t>(armor.GetSize()),
-                                armor.GetCenter().x, armor.GetCenter().y,
-                                static_cast<double>(armor.GetConfidence()));
-                }
-                const std::size_t count = std::min<std::size_t>(report.diagnostics.size(), 4);
-                for (std::size_t index = 0; index < count; ++index)
-                {
-                    const algorithm::vision::AssociationDiagnostic& diag = report.diagnostics[index];
-                    RCLCPP_INFO(get_logger(), "  cand=%zu face=%d norm=%.2f center=%.1f/%d corner=%.1f/%d angle=%.2f/%d perimeter=%.2f/%d",
-                                diag.candidate, diag.face, diag.normalized_cost,
-                                diag.center_error_px, diag.center_ok ? 1 : 0,
-                                diag.corner_error_px, diag.corner_ok ? 1 : 0,
-                                diag.angle_error_rad, diag.angle_ok ? 1 : 0,
-                                diag.perimeter_ratio, diag.perimeter_ok ? 1 : 0);
-                }
             }
             last_face_seen_ = face;
-        }
-        else
-        {
-            tracker_->Reset(algorithm::vision::ResetReason::Manual);
         }
     }
     else
@@ -363,6 +390,46 @@ void VisionNode::on_auto_aim(const std_msgs::msg::Bool& msg)
  */
 void VisionNode::on_tf(const tf2_msgs::msg::TFMessage& msg)
 {
+    update_armor_truth(msg);
+
+    // TF 从产生到被处理的时间：图像链路与 TF 链路各自有延迟，两边不一致就是时间错位的来源。
+    // 同时记到达间隔：间隔≈发布周期说明是单条消息在传输/排队里等，间隔本身就大说明仿真发得稀。
+    if (!msg.transforms.empty())
+    {
+        const rclcpp::Time tf_time(msg.transforms.front().header.stamp);
+        const rclcpp::Time arrival = now();
+        const double tf_stamp = tf_time.seconds();
+        const double delay = arrival.seconds() - tf_stamp;
+        if (delay >= 0.0 && delay < 1.0)
+        {
+            window_tf_delay_sum_ += delay;
+            ++window_tf_delay_count_;
+        }
+
+        if (last_tf_arrival_)
+        {
+            const double interval = (arrival - *last_tf_arrival_).seconds();
+            if (interval > 0.0 && interval < 0.5)
+            {
+                window_tf_interval_sum_ += interval;
+                ++window_tf_interval_count_;
+            }
+        }
+        last_tf_arrival_ = arrival;
+
+        // 发布侧自身的抖动：相邻两条消息的仿真时间戳差，与到达间隔对照
+        if (last_tf_stamp_)
+        {
+            const double stamp_interval = tf_stamp - *last_tf_stamp_;
+            if (stamp_interval > 0.0 && stamp_interval < 0.5)
+            {
+                window_tf_stamp_interval_sum_ += stamp_interval;
+                ++window_tf_stamp_interval_count_;
+            }
+        }
+        last_tf_stamp_ = tf_stamp;
+    }
+
     std::unordered_map<std::string, const geometry_msgs::msg::TransformStamped*> by_child;
     for (const geometry_msgs::msg::TransformStamped& transform : msg.transforms)
     {
@@ -433,6 +500,182 @@ void VisionNode::on_tf(const tf2_msgs::msg::TFMessage& msg)
 }
 
 /**
+ * @brief 缓存仿真发的装甲板真值
+ *
+ * `/tf` 里每条 `armor_<N>` 的 `header.frame_id` 是 `map`、`child_frame_id` 是 `armor_N`，
+ * 变换是板心在 map 中的位姿，可以直接当解算的真值。N 来自仿真的构建顺序，不保证连续，
+ * 所以按解析出来的下标存，越界的丢掉。
+ */
+void VisionNode::update_armor_truth(const tf2_msgs::msg::TFMessage& msg)
+{
+    for (const geometry_msgs::msg::TransformStamped& transform : msg.transforms)
+    {
+        const std::string& child = transform.child_frame_id;
+        if (child.compare(0, 6, "armor_") != 0 || transform.header.frame_id != params_.aim_frame)
+        {
+            continue;
+        }
+
+        const std::string index_text = child.substr(6);
+        if (index_text.empty())
+        {
+            continue;
+        }
+
+        std::int32_t index = 0;
+        bool valid = true;
+        for (const char digit : index_text)
+        {
+            if (digit < '0' || digit > '9')
+            {
+                valid = false;
+                break;
+            }
+            index = index * 10 + (digit - '0');
+        }
+        if (!valid || index < 0 || static_cast<std::size_t>(index) >= armor_truth_.size())
+        {
+            continue;
+        }
+
+        algorithm::vision::PoseSample truth;
+        truth.rotation = ToEigen(transform.transform.rotation);
+        truth.translation = Eigen::Vector3d(transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z);
+        armor_truth_[static_cast<std::size_t>(index)].Push(rclcpp::Time(transform.header.stamp).seconds(), truth);
+    }
+}
+
+/**
+ * @brief 把本帧检测和真值配对，统计配对距离与 PnP 误差
+ *
+ * 配对用 map 系下板心位置：检测先按 PnP 解出相机系位姿、再换到 map，取距离最近的真值板。
+ * 这里只用最近邻，不保证一对一——单板场景下一块检测对上一块真值，P0 要的是"配对本身对得上"。
+ *
+ * 配对成功后按相机视线拆横向/深度误差：横向由像素精度决定，深度由板宽与距离决定，
+ * 两者量级差一个数量级，混在一起看不出 PnP 到底差在哪一项。
+ */
+void VisionNode::pair_armor_truth(const std::vector<algorithm::vision::DetectedArmor>& armors, double image_stamp)
+{
+    if (!frame_ || !camera_)
+    {
+        return;
+    }
+
+    std::uint64_t frame_ok = 0;
+    for (const algorithm::vision::DetectedArmor& armor : armors)
+    {
+        const std::optional<std::array<cv::Point3f, 4>> object_points = algorithm::vision::MakeObjectPoints(armor.GetSize(), algorithm::vision::ArmorDimensions {});
+        const std::optional<algorithm::vision::ArmorPose> pose = object_points ? algorithm::vision::SolvePose(armor.GetCorners(), *object_points, *camera_) : std::nullopt;
+        if (!pose)
+        {
+            ++window_pair_fail_;
+            continue;
+        }
+
+        const Eigen::Vector3d center_camera(pose->tvec[0], pose->tvec[1], pose->tvec[2]);
+        const Eigen::Vector3d center_map = algorithm::vision::CameraToFrame(center_camera, *frame_);
+
+        // 真值按图像时刻取：小陀螺下板心 1.5 m/s，用最新一条会引入几十毫米的假误差
+        double best_distance = std::numeric_limits<double>::max();
+        std::optional<algorithm::vision::PoseSample> best_truth;
+        std::size_t best_truth_index = 0;
+        for (std::size_t index = 0; index < armor_truth_.size(); ++index)
+        {
+            const std::optional<algorithm::vision::PoseSample> truth = armor_truth_[index].At(image_stamp, params_.pose_hold_s);
+            if (!truth)
+            {
+                continue;
+            }
+            const double distance = (center_map - truth->translation).norm();
+            if (distance < best_distance)
+            {
+                best_distance = distance;
+                best_truth = truth;
+                best_truth_index = index;
+            }
+        }
+
+        // 超过半米就不是同一块板：宁可记失败，也不让错误配对污染后面的精度统计
+        if (!best_truth || best_distance > 0.5)
+        {
+            ++window_pair_fail_;
+            continue;
+        }
+
+        ++frame_ok;
+        ++window_pair_ok_;
+
+        // 误差按相机视线拆开：û 是检测点在相机系的方向，横向与深度用同一组真值算
+        const Eigen::Vector3d error_map = center_map - best_truth->translation;
+        const Eigen::Vector3d error_camera = frame_->rotation.transpose() * error_map;
+        const Eigen::Vector3d view = center_camera.norm() > 0.0 ? center_camera.normalized() : Eigen::Vector3d::UnitZ();
+        // 深度误差保留符号：取绝对值后它的均值恒为正，会冒充成"有偏"
+        const double depth_error = error_camera.dot(view);
+        const double lateral_error = (error_camera - error_camera.dot(view) * view).norm();
+
+        ++window_pnp_count_;
+        // 有偏性判据：各向同性的角点噪声只会让 |mean| << rms；两者接近说明是固定偏置
+        window_error_sum_ += error_camera;
+        window_error_square_sum_ += error_camera.squaredNorm();
+        window_pnp_lat_sum_ += lateral_error;
+        window_pnp_lat_max_ = std::max(window_pnp_lat_max_, lateral_error);
+        window_pnp_depth_sum_ += depth_error;
+        window_pnp_depth_abs_sum_ += std::abs(depth_error);
+        window_pnp_depth_max_ = std::max(window_pnp_depth_max_, std::abs(depth_error));
+        window_pnp_reproj_sum_ += pose->reprojection_error_px;
+        window_pnp_reproj_max_ = std::max(window_pnp_reproj_max_, pose->reprojection_error_px);
+
+        // 时间偏移估计：真值有速度，误差沿速度方向的分量直接给出"我们的时刻比真值早/晚多少"。
+        // dt = (error · v) / |v|² 是单帧最小二乘解；窗口内取平均就是这一秒的有效时刻差。
+        // 这是 P2 的核心量：横向 bias 若主要来自时刻错位，dt 乘速度应当正好等于 bias。
+        {
+            const algorithm::vision::PoseBuffer& buffer = armor_truth_[best_truth_index];
+            const std::optional<algorithm::vision::PoseSample> later = buffer.At(image_stamp + 0.01, 0.0);
+            const std::optional<algorithm::vision::PoseSample> earlier = buffer.At(image_stamp - 0.01, 0.0);
+            if (later && earlier)
+            {
+                const Eigen::Vector3d velocity = (later->translation - earlier->translation) / 0.02;
+                const double speed_squared = velocity.squaredNorm();
+                if (speed_squared > 0.01)
+                {
+                    window_time_offset_sum_ += error_map.dot(velocity) / speed_squared;
+                    ++window_time_offset_count_;
+                }
+            }
+        }
+
+        // 法向 yaw 误差：真值板系的 x 轴（法向）与 PnP 法向都投到 map 水平面取方位角。
+        // 装甲板法向是一条轴而不是方向——朝里朝外是同一块板，真值帧的 x 轴指向与
+        // `ArmorRotation` 的约定差 π，所以按轴比，取两个方向里小的那个；同时数翻转次数，
+        // 翻转频繁就是 IPPE 二义没被 `OptimizeYaw` 压住。
+        const Eigen::Vector3d true_normal = best_truth->rotation.toRotationMatrix().col(0);
+        const double true_yaw = std::atan2(true_normal.y(), true_normal.x());
+        cv::Matx33d rotation;
+        cv::Rodrigues(cv::Mat(pose->rvec), rotation);
+        const Eigen::Vector3d camera_normal(rotation(0, 0), rotation(1, 0), rotation(2, 0));
+        const Eigen::Vector3d pnp_normal = frame_->rotation * camera_normal;
+        const double pnp_yaw = std::atan2(pnp_normal.y(), pnp_normal.x());
+        const double forward_error = std::abs(algorithm::math::normalize_radian_pm_pi(pnp_yaw - true_yaw));
+        const double flipped_error = std::abs(algorithm::math::normalize_radian_pm_pi(pnp_yaw - true_yaw - M_PI));
+        const double yaw_error = std::min(forward_error, flipped_error);
+        const bool flipped = flipped_error < forward_error;
+        if (yaw_branch_valid_ && flipped != yaw_branch_flipped_)
+        {
+            ++window_pnp_yaw_flips_;
+        }
+        yaw_branch_valid_ = true;
+        yaw_branch_flipped_ = flipped;
+        window_pnp_yaw_sum_ += yaw_error;
+        window_pnp_yaw_max_ = std::max(window_pnp_yaw_max_, yaw_error);
+    }
+
+    if (frame_ok == 0)
+    {
+        ++window_pair_empty_;
+    }
+}
+
+/**
  * @brief 位姿样本 → 跟踪器用的帧变换
  */
 algorithm::vision::FrameTransform VisionNode::MakeFrameTransform(const algorithm::vision::PoseSample& sample)
@@ -487,9 +730,12 @@ void VisionNode::draw_armors(cv::Mat& drawn, const std::vector<algorithm::vision
  * @brief 描目标的四面：状态推出来的轮廓
  *
  * 照参考工程的叠加层（`visualization/vision_overlay.cpp`）：四面全画（同一套状态，
- * 只是转角相差 2π/armor_num），当前匹配到的那面用绿色，其余三面用黄色；
- * 再有自瞄目标时画红色瞄准点，画面中心画白色准星。参考只要 target 存在就画，
- * 不要求 tracking——否则 detecting/temp_lost 那几帧整组框会消失。
+ * 只是转角相差 2π/armor_num）。瞄准面红色、本帧匹配到的面绿色、其余三面黄色；
+ * 画面中心画白色准星。参考只要 target 存在就画，不要求 tracking——否则
+ * detecting/temp_lost 那几帧整组框会消失。
+ *
+ * 瞄准面与本帧匹配面不是一回事：小陀螺下匹配面每 0.21 s 换一块，瞄准面要按
+ * 可射击性自己选，两个面序经常不同。
  */
 void VisionNode::draw_targets(cv::Mat& drawn) const
 {
@@ -497,11 +743,21 @@ void VisionNode::draw_targets(cv::Mat& drawn) const
     {
         // 用实测的装甲尺寸：拿小板的物点去投大板，框会明显偏小
         const std::int32_t current_face = tracker_->Report().last_face;
+        const std::int32_t aim_face = aim_publisher_ ? aim_publisher_->aim_face() : -1;
         const std::vector<algorithm::vision::FaceState> faces = tracker_->Faces();
         for (std::size_t index = 0; index < faces.size(); ++index)
         {
-            // 当前面绿、其余面黄；四面共用一套状态，只是转角相差一个面序步长
-            const cv::Scalar color = (static_cast<std::int32_t>(index) == current_face) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
+            // 瞄准面红、本帧匹配面绿、其余面黄；四面共用一套状态，只是转角相差一个面序步长
+            const std::int32_t face_index = static_cast<std::int32_t>(index);
+            cv::Scalar color(0, 255, 255);
+            if (face_index == aim_face)
+            {
+                color = cv::Scalar(0, 0, 255);
+            }
+            else if (face_index == current_face)
+            {
+                color = cv::Scalar(0, 255, 0);
+            }
             draw_face(drawn, faces[index], color, 2);
         }
     }
@@ -635,32 +891,73 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
 
     const algorithm::vision::TrackerReport& report = tracker_->Report();
     const algorithm::vision::VehicleEKF::Snapshot snapshot = tracker_->DebugSnapshot();
-    RCLCPP_INFO(get_logger(), "track state=%s active=%d converged=%d updates=%d losses=%d gate=%d resets=%d reset=%s face=%d cost=%.3f r=%.3fm nis=%.2f nis_rate=%.2f",
+    RCLCPP_INFO(get_logger(), "track state=%s active=%d converged=%d updates=%d losses=%d gate=%d resets=%d reset=%s face=%d cost=%.3f r=%.3fm nis=%.2f nis_rate=%.2f resid=%.2fpx",
                 StateName(report.state), report.active ? 1 : 0, report.converged ? 1 : 0,
                 report.updates, report.losses, report.gate_rejects, report.resets, ResetReasonName(report.last_reset_reason),
-                report.last_face, report.last_cost, tracker_->Radius(), snapshot.last_nis, tracker_->NisFailureRate());
-    // 本帧候选、匹配数与归一化代价最低的几次尝试：一眼看出是没候选、配不上还是全被门拒
+                report.last_face, report.last_cost, tracker_->Radius(), snapshot.last_nis, tracker_->NisFailureRate(),
+                snapshot.residual_rms_px);
+    // 本帧候选与匹配数：一眼看出是没候选、配不上还是全被门拒
     RCLCPP_INFO(get_logger(), "  assoc candidates=%zu matches=%zu", report.candidate_count, report.match_count);
-    const std::size_t diagnostic_count = std::min<std::size_t>(report.diagnostics.size(), 8);
-    for (std::size_t index = 0; index < diagnostic_count; ++index)
-    {
-        const algorithm::vision::AssociationDiagnostic& diag = report.diagnostics[index];
-        RCLCPP_INFO(get_logger(), "    try%d cand=%zu face=%d norm=%.2f center=%.1f/%d corner=%.1f/%d angle=%.2f/%d perimeter=%.2f/%d det_center=(%.0f, %.0f)",
-                    static_cast<std::int32_t>(index), diag.candidate, diag.face, diag.normalized_cost,
-                    diag.center_error_px, diag.center_ok ? 1 : 0,
-                    diag.corner_error_px, diag.corner_ok ? 1 : 0,
-                    diag.angle_error_rad, diag.angle_ok ? 1 : 0,
-                    diag.perimeter_ratio, diag.perimeter_ok ? 1 : 0,
-                    0.25 * (diag.corners[0].x + diag.corners[1].x + diag.corners[2].x + diag.corners[3].x),
-                    0.25 * (diag.corners[0].y + diag.corners[1].y + diag.corners[2].y + diag.corners[3].y));
-    }
     RCLCPP_INFO(get_logger(), "  obs image=%d ypda=%d limit_clamps=%d pose_missing=%llu",
                 snapshot.image_updates, snapshot.ypda_updates, snapshot.limit_clamps,
                 static_cast<unsigned long long>(window_pose_missing_));
+    // 真值配对成功率（P0 判据）+ PnP 误差分解（P1 判据）
+    RCLCPP_INFO(get_logger(), "  truth pair ok=%llu fail=%llu empty_frames=%llu",
+                static_cast<unsigned long long>(window_pair_ok_),
+                static_cast<unsigned long long>(window_pair_fail_),
+                static_cast<unsigned long long>(window_pair_empty_));
+    if (window_pnp_count_ > 0)
+    {
+        const double count = static_cast<double>(window_pnp_count_);
+        // mean 是误差向量的平均（有偏部分），rms 是均方根（有偏 + 随机）。
+        // |mean| ≈ rms：固定偏置（真值参考点与我们的板心不是一个点）；|mean| << rms：随机噪声。
+        const Eigen::Vector3d error_mean = window_error_sum_ / count;
+        const double error_rms = std::sqrt(window_error_square_sum_ / count);
+        RCLCPP_INFO(get_logger(), "  pnp lat=%.1f/%.1fmm depth=%.2f/%.2fm reproj=%.2f/%.2fpx yaw=%.1f/%.1fdeg flips=%llu bias=%.1fmm rms=%.1fmm n=%llu",
+                    window_pnp_lat_sum_ / count * 1000.0, window_pnp_lat_max_ * 1000.0,
+                    window_pnp_depth_sum_ / count, window_pnp_depth_max_,
+                    window_pnp_reproj_sum_ / count, window_pnp_reproj_max_,
+                    window_pnp_yaw_sum_ / count * 180.0 / M_PI, window_pnp_yaw_max_ * 180.0 / M_PI,
+                    static_cast<unsigned long long>(window_pnp_yaw_flips_),
+                    error_mean.norm() * 1000.0, error_rms * 1000.0,
+                    static_cast<unsigned long long>(window_pnp_count_));
+        // 深度误差单独给带符号与绝对值两列：符号看系统偏近还是偏远，绝对值看幅度
+        RCLCPP_INFO(get_logger(), "  depth signed=%.3fm abs=%.3fm",
+                    window_pnp_depth_sum_ / count,
+                    window_pnp_depth_abs_sum_ / count);
+        // 有效时刻差：正数表示"图像内容对应的时刻比 image_stamp 早"，是 P2 要消掉的量
+        if (window_time_offset_count_ > 0)
+        {
+            RCLCPP_INFO(get_logger(), "  time offset=%.1fms n=%llu",
+                        window_time_offset_sum_ / static_cast<double>(window_time_offset_count_) * 1000.0,
+                        static_cast<unsigned long long>(window_time_offset_count_));
+        }
+    }
+    // P4：锁定满 1 s 的车心漂移
+    if (window_drift_1s_count_ > 0)
+    {
+        RCLCPP_INFO(get_logger(), "  drift1s avg=%.3fm max=%.3fm n=%llu",
+                    window_drift_1s_sum_ / static_cast<double>(window_drift_1s_count_),
+                    window_drift_max_,
+                    static_cast<unsigned long long>(window_drift_1s_count_));
+    }
     const double offset_denominator = window_frames_ == 0 ? 1.0 : static_cast<double>(window_frames_);
     RCLCPP_INFO(get_logger(), "  pose offset avg=%.1fms min=%.1fms max=%.1fms hold=%.0fms",
                 window_pose_offset_sum_ / offset_denominator * 1000.0,
                 window_pose_offset_min_ * 1000.0, window_pose_offset_max_ * 1000.0, params_.pose_hold_s * 1000.0);
+    // P2：三条时间量的对照。tf_delay 是 TF 链路延迟，span 是插值跨度，
+    // time offset 是真值给出的"图像内容实际时刻"相对 image_stamp 的差。
+    {
+        const double tf_denominator = window_tf_delay_count_ == 0 ? 1.0 : static_cast<double>(window_tf_delay_count_);
+        const double span_denominator = window_pose_span_count_ == 0 ? 1.0 : static_cast<double>(window_pose_span_count_);
+        const double interval_denominator = window_tf_interval_count_ == 0 ? 1.0 : static_cast<double>(window_tf_interval_count_);
+        const double stamp_denominator = window_tf_stamp_interval_count_ == 0 ? 1.0 : static_cast<double>(window_tf_stamp_interval_count_);
+        RCLCPP_INFO(get_logger(), "  timing tf_delay=%.1fms span=%.1fms tf_gap=%.1fms tf_stamp_gap=%.1fms",
+                    window_tf_delay_sum_ / tf_denominator * 1000.0,
+                    window_pose_span_sum_ / span_denominator * 1000.0,
+                    window_tf_interval_sum_ / interval_denominator * 1000.0,
+                    window_tf_stamp_interval_sum_ / stamp_denominator * 1000.0);
+    }
 
     if (report.active)
     {
@@ -674,11 +971,6 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
                     snapshot.covariance_diag[0], snapshot.covariance_diag[2], snapshot.covariance_diag[4],
                     snapshot.covariance_diag[6], snapshot.covariance_diag[7],
                     snapshot.covariance_diag[8], snapshot.covariance_diag[9], snapshot.covariance_diag[10]);
-        // 形状量是否被观测约束：雅可比范数为 0 表示本帧完全没约束到；修正量看它被拖向哪边
-        RCLCPP_INFO(get_logger(), "  ekf shape jac=(%.3f, %.3f, %.3f) step=(%.5f, %.5f, %.5f) estimate=%d faces=%zu",
-                    snapshot.shape_jacobian_norm_r, snapshot.shape_jacobian_norm_l, snapshot.shape_jacobian_norm_h,
-                    snapshot.shape_radius_step, snapshot.shape_radius_gap_step, snapshot.shape_height_gap_step,
-                    report.match_count >= 2 ? 1 : 0, report.match_count);
     }
 
     window_frames_ = 0;
@@ -689,7 +981,36 @@ void VisionNode::log_window(const algorithm::vision::ArmorDetectionResult& resul
     window_stats_ = algorithm::vision::ArmorDetectionStats {};
     window_enemy_min_ = 0;
     window_pose_offset_sum_ = 0.0;
+    window_drift_1s_sum_ = 0.0;
+    window_drift_1s_count_ = 0;
+    window_drift_max_ = 0.0;
     window_pose_offset_min_ = 0.0;
     window_pose_offset_max_ = 0.0;
+    window_pair_ok_ = 0;
+    window_pair_fail_ = 0;
+    window_pair_empty_ = 0;
+    window_pnp_count_ = 0;
+    window_error_sum_.setZero();
+    window_error_square_sum_ = 0.0;
+    window_time_offset_sum_ = 0.0;
+    window_time_offset_count_ = 0;
+    window_tf_delay_sum_ = 0.0;
+    window_tf_delay_count_ = 0;
+    window_tf_interval_sum_ = 0.0;
+    window_tf_interval_count_ = 0;
+    window_tf_stamp_interval_sum_ = 0.0;
+    window_tf_stamp_interval_count_ = 0;
+    window_pose_span_sum_ = 0.0;
+    window_pose_span_count_ = 0;
+    window_pnp_lat_sum_ = 0.0;
+    window_pnp_lat_max_ = 0.0;
+    window_pnp_depth_sum_ = 0.0;
+    window_pnp_depth_abs_sum_ = 0.0;
+    window_pnp_depth_max_ = 0.0;
+    window_pnp_reproj_sum_ = 0.0;
+    window_pnp_reproj_max_ = 0.0;
+    window_pnp_yaw_sum_ = 0.0;
+    window_pnp_yaw_max_ = 0.0;
+    window_pnp_yaw_flips_ = 0;
     window_start_ = now();
 }

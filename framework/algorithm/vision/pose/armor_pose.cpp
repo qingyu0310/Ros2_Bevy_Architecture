@@ -328,28 +328,49 @@ std::optional<ArmorPose> SolvePose(const std::array<cv::Point2f, 4>& corners, co
     const std::vector<cv::Point3f> object_list(object_points.begin(), object_points.end());
     const std::vector<cv::Point2f> image_list(corners.begin(), corners.end());
 
-    cv::Vec3d rvec {};
-    cv::Vec3d tvec {};
-    // useExtrinsicGuess = false：每帧独立解，不继承上一帧；共面四点用 IPPE
-    if (!cv::solvePnP(object_list, image_list, camera_matrix, distort, rvec, tvec, false, cv::SOLVEPNP_IPPE))
+    // 共面四点用 IPPE。IPPE 对这个几何有两个解（板正面朝相机 / 背面朝相机），
+    // solvePnP 只返回其中一个，选哪个取决于板尺寸与姿态，没有保证。
+    // 这里把两个解都解出来，按四角重投影误差取小的那个；背面解会让 z 变负、误差大一个量级。
+    std::vector<cv::Mat> rvecs;
+    std::vector<cv::Mat> tvecs;
+    if (!cv::solvePnPGeneric(object_list, image_list, camera_matrix, distort, rvecs, tvecs, false, cv::SOLVEPNP_IPPE) || rvecs.empty())
     {
         return std::nullopt;
     }
 
-    std::vector<cv::Point2f> projected;
-    cv::projectPoints(object_list, rvec, tvec, camera_matrix, distort, projected);
-    if (projected.size() != object_points.size())
+    // 优先取"板在相机前方"的解；两个解都不在前方时仍按重投影误差取一个，
+    // 返回空会让调用方整帧丢掉观测，比给一个可疑解更糟（跟踪器还会做门限与 NIS 判断）。
+    std::optional<ArmorPose> best;
+    bool best_in_front = false;
+    for (std::size_t index = 0; index < rvecs.size(); ++index)
     {
-        return std::nullopt;
+        const cv::Vec3d rvec(rvecs[index]);
+        const cv::Vec3d tvec(tvecs[index]);
+
+        std::vector<cv::Point2f> projected;
+        cv::projectPoints(object_list, rvec, tvec, camera_matrix, distort, projected);
+        if (projected.size() != object_points.size())
+        {
+            continue;
+        }
+
+        ArmorPose pose;
+        pose.rvec = rvec;
+        pose.tvec = tvec;
+        pose.reprojection_error_px = MeanReprojectionError(corners, projected);
+        std::copy(projected.begin(), projected.end(), pose.projected.begin());
+
+        const bool in_front = tvec[2] > 0.0;
+        const bool better = !best || (in_front && !best_in_front) ||
+                            (in_front == best_in_front && pose.reprojection_error_px < best->reprojection_error_px);
+        if (better)
+        {
+            best = pose;
+            best_in_front = in_front;
+        }
     }
 
-    ArmorPose pose;
-    pose.rvec = rvec;
-    pose.tvec = tvec;
-    pose.reprojection_error_px = MeanReprojectionError(corners, projected);
-    std::copy(projected.begin(), projected.end(), pose.projected.begin());
-
-    return pose;
+    return best;
 }
 
 /**

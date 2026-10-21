@@ -208,6 +208,7 @@ public:
         std::array<double, 11> covariance_diag {};  // 状态协方差对角
         std::int32_t image_updates {0};             // 走 8 维角点像素观测的更新次数
         std::int32_t ypda_updates {0};              // 回退到 4 维 ypda 观测的更新次数
+        double residual_rms_px {0.0};               // 最近一次像素更新的残差均方根，单位 pixel
         std::int32_t limit_clamps {0};              // 半径/第二半径被钳回范围的次数
         double shape_radius_step {0.0};             // 最近一次更新里 r 的修正量，单位 m
         double shape_radius_gap_step {0.0};         // 最近一次更新里 l 的修正量，单位 m
@@ -262,6 +263,7 @@ private:
     double shape_jacobian_norm_r_ {0.0};
     double shape_jacobian_norm_l_ {0.0};
     double shape_jacobian_norm_h_ {0.0};
+    double residual_rms_px_ {0.0};              // 最近一次像素更新的残差均方根，单位 pixel
 
     VehicleEKFConfig config_;
     Filter             filter_;

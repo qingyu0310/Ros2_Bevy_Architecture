@@ -26,13 +26,13 @@ namespace algorithm::vision
  */
 struct AimSolverInput
 {
-    Eigen::Vector3d aim_camera {};                  // 瞄准点，相机系，单位 m
-    Eigen::Matrix3d map_from_camera {Eigen::Matrix3d::Identity()}; // 相机系 → map
-    Eigen::Vector3d camera_in_map {};               // 相机原点在 map，单位 m
-    Eigen::Vector3d gimbal_in_map {};               // 云台原点在 map，单位 m
-    double fire_angle_deg {1.5};                    // 开火允许的 pitch 偏差，单位度
-    double distance_max_m {8.0};                    // 可视与开火距离上限，单位 m
-    double min_forward_m {0.1};                     // 瞄准点在相机系的最小前向距离，单位 m
+    Eigen::Vector3d aim_camera {};                                      // 瞄准点，相机系，单位 m
+    Eigen::Matrix3d map_from_camera {Eigen::Matrix3d::Identity()};   // 相机系 → map
+    Eigen::Vector3d camera_in_map {};                                   // 相机原点在 map，单位 m
+    Eigen::Vector3d gimbal_in_map {};                                   // 云台原点在 map，单位 m
+    double fire_angle_deg {1.5};                                        // 开火允许的 pitch 偏差，单位度
+    double distance_max_m {8.0};                                        // 可视与开火距离上限，单位 m
+    double min_forward_m {0.1};                                         // 瞄准点在相机系的最小前向距离，单位 m
 };
 
 /**
@@ -40,10 +40,10 @@ struct AimSolverInput
  */
 struct AimSolution
 {
-    double yaw_deg {0.0};                           // 云台期望绝对 yaw，从 map x 轴量起
-    double pitch_deg {90.0};                        // 云台期望 pitch，从 map 竖直轴量起
-    double distance_m {0.0};                        // 相机到瞄准点的直线距离
-    bool   fire_advice {false};                     // 是否满足开火判定
+    double yaw_deg {0.0};                                               // 云台期望绝对 yaw，从 map x 轴量起
+    double pitch_deg {90.0};                                            // 云台期望 pitch，从 map 竖直轴量起
+    double distance_m {0.0};                                            // 相机到瞄准点的直线距离
+    bool   fire_advice {false};                                         // 是否满足开火判定
 };
 
 /**
